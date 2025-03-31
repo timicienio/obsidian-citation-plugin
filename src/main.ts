@@ -15,7 +15,6 @@ import {
   TemplateDelegate as Template,
 } from 'handlebars';
 
-
 import CitationEvents from './events';
 import {
   InsertCitationModal,
@@ -40,6 +39,7 @@ import {
   WorkerManagerBlocked,
 } from './util';
 import LoadWorker from 'web-worker:./worker';
+import { entries } from 'lodash';
 
 export default class CitationPlugin extends Plugin {
   settings: CitationsPluginSettings;
@@ -78,7 +78,7 @@ export default class CitationPlugin extends Plugin {
     if (!loadedSettings) return;
 
     const toLoad = [
-      'citationExportPath',
+      'citationExportPaths',
       'citationExportFormat',
       'literatureNoteTitleTemplate',
       'literatureNoteFolder',
@@ -98,11 +98,14 @@ export default class CitationPlugin extends Plugin {
   }
 
   onload(): void {
-    this.loadSettings().then(() => this.init());
+    this.loadSettings().then(() => {
+      this.init();
+      this.loadLibraries();
+    });
   }
 
   async init(): Promise<void> {
-    if (this.settings.citationExportPath) {
+    if (this.settings.citationExportPaths) {
       // Load library for the first time
       this.loadLibrary();
 
@@ -120,7 +123,9 @@ export default class CitationPlugin extends Plugin {
 
         chokidar
           .watch(
-            this.resolveLibraryPath(this.settings.citationExportPath),
+            this.settings.citationExportPaths.map((p) =>
+              this.resolveLibraryPath(p),
+            ),
             watchOptions,
           )
           .on('change', () => {
@@ -194,34 +199,110 @@ export default class CitationPlugin extends Plugin {
         : '/';
     return path.resolve(vaultRoot, rawPath);
   }
-
   async loadLibrary(): Promise<Library> {
     console.debug('Citation plugin: Reloading library');
-    if (this.settings.citationExportPath) {
-      const filePath = this.resolveLibraryPath(
-        this.settings.citationExportPath,
-      );
-
+    if (
+      this.settings.citationExportPaths &&
+      this.settings.citationExportPaths.length > 0
+    ) {
       // Unload current library.
       this.events.trigger('library-load-start');
       this.library = null;
 
-      return FileSystemAdapter.readLocalFile(filePath)
-        .then((buffer) => {
-          // If there is a remaining error message, hide it
-          this.loadErrorNotifier.hide();
+      const libraries: Library[] = await Promise.all(
+        this.settings.citationExportPaths.map(async (rawPath) => {
+          const filePath = this.resolveLibraryPath(rawPath);
 
-          // Decode file as UTF-8.
+          try {
+            const buffer = await FileSystemAdapter.readLocalFile(filePath);
+
+            // If there is a remaining error message, hide it
+            this.loadErrorNotifier.hide();
+
+            // Decode file as UTF-8.
+            const dataView = new DataView(buffer);
+            const decoder = new TextDecoder('utf8');
+            const value = decoder.decode(dataView);
+
+            const entries: EntryData[] = await this.loadWorker.post({
+              databaseRaw: value,
+              databaseType: this.settings.citationExportFormat,
+            });
+
+            let adapter: new (data: EntryData) => Entry;
+            let idKey: string;
+
+            switch (this.settings.citationExportFormat) {
+              case 'biblatex':
+                adapter = EntryBibLaTeXAdapter;
+                idKey = 'key';
+                break;
+              case 'csl-json':
+                adapter = EntryCSLAdapter;
+                idKey = 'id';
+                break;
+            }
+
+            return new Library(
+              Object.fromEntries(
+                entries.map((e) => [(e as IIndexable)[idKey], new adapter(e)]),
+              ),
+            );
+          } catch (e) {
+            console.error(`Failed to load library from path: ${rawPath}`, e);
+            return null;
+          }
+        }),
+      );
+
+      // Merge libraries
+      const mergedEntries = Object.assign(
+        {},
+        ...libraries.filter(Boolean).map((lib) => lib.entries),
+      );
+      this.library = new Library(mergedEntries);
+
+      console.debug(
+        `Citation plugin: successfully loaded and merged libraries with ${this.library.size} entries.`,
+      );
+
+      this.events.trigger('library-load-complete');
+      return this.library;
+    } else {
+      console.warn(
+        'Citations plugin: citation export paths are not set. Please update plugin settings.',
+      );
+    }
+  }
+
+  async loadLibraries(): Promise<void> {
+    console.debug('Citation plugin: Reloading libraries');
+    const paths = this.settings.citationExportPaths;
+
+    if (paths.length === 0) {
+      console.warn(
+        'Citations plugin: No library paths set. Please update plugin settings.',
+      );
+      return;
+    }
+
+    this.events.trigger('library-load-start');
+    this.library = null;
+
+    const libraries: Library[] = await Promise.all(
+      paths.map(async (rawPath) => {
+        const filePath = this.resolveLibraryPath(rawPath);
+        try {
+          const buffer = await FileSystemAdapter.readLocalFile(filePath);
           const dataView = new DataView(buffer);
           const decoder = new TextDecoder('utf8');
           const value = decoder.decode(dataView);
 
-          return this.loadWorker.post({
+          const entries: EntryData[] = await this.loadWorker.post({
             databaseRaw: value,
             databaseType: this.settings.citationExportFormat,
           });
-        })
-        .then((entries: EntryData[]) => {
+
           let adapter: new (data: EntryData) => Entry;
           let idKey: string;
 
@@ -236,36 +317,29 @@ export default class CitationPlugin extends Plugin {
               break;
           }
 
-          this.library = new Library(
+          return new Library(
             Object.fromEntries(
               entries.map((e) => [(e as IIndexable)[idKey], new adapter(e)]),
             ),
           );
-          console.debug(
-            `Citation plugin: successfully loaded library with ${this.library.size} entries.`,
-          );
-
-          this.events.trigger('library-load-complete');
-
-          return this.library;
-        })
-        .catch((e) => {
-          if (e instanceof WorkerManagerBlocked) {
-            // Silently catch WorkerManager error, which will be thrown if the
-            // library is already being loaded
-            return;
-          }
-
-          console.error(e);
-          this.loadErrorNotifier.show();
-
+        } catch (e) {
+          console.error(`Failed to load library from path: ${rawPath}`, e);
           return null;
-        });
-    } else {
-      console.warn(
-        'Citations plugin: citation export path is not set. Please update plugin settings.',
-      );
-    }
+        }
+      }),
+    );
+
+    // Merge libraries
+    const mergedEntries = Object.assign(
+      {},
+      ...libraries.filter(Boolean).map((lib) => lib.entries),
+    );
+    this.library = new Library(mergedEntries);
+
+    console.debug(
+      `Citation plugin: successfully loaded and merged libraries with ${this.library.size} entries.`,
+    );
+    this.events.trigger('library-load-complete');
   }
 
   /**

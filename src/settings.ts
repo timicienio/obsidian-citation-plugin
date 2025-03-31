@@ -16,7 +16,7 @@ const CITATION_DATABASE_FORMAT_LABELS: Record<DatabaseType, string> = {
 };
 
 export class CitationsPluginSettings {
-  public citationExportPath: string;
+  public citationExportPaths: string[] = [];
   citationExportFormat: DatabaseType = 'csl-json';
 
   literatureNoteTitleTemplate = '@{{citekey}}';
@@ -46,8 +46,10 @@ export class CitationSettingTab extends PluginSettingTab {
 
   open(): void {
     super.open();
-    this.checkCitationExportPath(
-      this.plugin.settings.citationExportPath,
+    Promise.all(
+      this.plugin.settings.citationExportPaths.map((path) => {
+        this.checkCitationExportPath(path);
+      }),
     ).then(() => this.showCitationExportPathSuccess());
   }
 
@@ -89,47 +91,52 @@ export class CitationSettingTab extends PluginSettingTab {
         this.buildValueInput(
           component.addOptions(CITATION_DATABASE_FORMAT_LABELS),
           'citationExportFormat',
-          (value) => {
-            this.checkCitationExportPath(
-              this.plugin.settings.citationExportPath,
-            ).then((success) => {
-              if (success) {
-                this.citationPathSuccessEl.addClass('d-none');
-                this.citationPathLoadingEl.removeClass('d-none');
-
-                this.plugin.loadLibrary().then(() => {
-                  this.citationPathLoadingEl.addClass('d-none');
-                  this.showCitationExportPathSuccess();
-                });
-              }
-            });
-          },
+          () => this.plugin.loadLibraries(),
         ),
       );
 
-    // NB: we force reload of the library on path change.
-    new Setting(containerEl)
-      .setName('Citation database path')
-      .setDesc(
-        'Path to citation library exported by your reference manager. ' +
-          'Can be an absolute path or a path relative to the current vault root folder. ' +
-          'Citations will be automatically reloaded whenever this file updates.',
-      )
-      .addText((input) =>
-        this.buildValueInput(
-          input.setPlaceholder('/path/to/export.json'),
-          'citationExportPath',
-          (value) => {
-            this.checkCitationExportPath(value).then(
-              (success) =>
-                success &&
-                this.plugin
-                  .loadLibrary()
-                  .then(() => this.showCitationExportPathSuccess()),
-            );
-          },
-        ),
-      );
+    containerEl.createEl('h3', { text: 'Citation database paths' });
+
+    this.plugin.settings.citationExportPaths.forEach((path, index) => {
+      new Setting(containerEl)
+        .setName(`Library Path ${index + 1}`)
+        .setDesc(
+          'Path to citation library exported by your reference manager. ' +
+            'Can be an absolute path or a path relative to the current vault root folder. ' +
+            'Citations will be automatically reloaded whenever this file updates.',
+        )
+        .addText((input) =>
+          this.buildValueInput(
+            input.setPlaceholder('/path/to/export.json'),
+            'citationExportPath',
+            (value) => {
+              this.checkCitationExportPath(value).then(
+                (success) =>
+                  success &&
+                  this.plugin
+                    .loadLibrary()
+                    .then(() => this.showCitationExportPathSuccess()),
+              );
+            },
+          ),
+        )
+        .addExtraButton((btn) =>
+          btn
+            .setIcon('trash')
+            .setTooltip('Remove')
+            .onClick(() => {
+              this.plugin.settings.citationExportPaths.splice(index, 1);
+              this.plugin.saveSettings().then(() => this.display());
+            }),
+        );
+    });
+
+    new Setting(containerEl).setName('Add new library path').addButton((btn) =>
+      btn.setButtonText('Add').onClick(() => {
+        this.plugin.settings.citationExportPaths.push('');
+        this.plugin.saveSettings().then(() => this.display());
+      }),
+    );
 
     this.citationPathLoadingEl = containerEl.createEl('p', {
       cls: 'zoteroSettingCitationPathLoading d-none',
